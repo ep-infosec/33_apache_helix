@@ -1,0 +1,255 @@
+package org.apache.helix.monitoring.mbeans;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import java.lang.management.ManagementFactory;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import javax.management.MBeanAttributeInfo;
+import javax.management.MBeanInfo;
+import javax.management.MBeanServerConnection;
+import javax.management.ObjectInstance;
+import javax.management.ObjectName;
+import javax.management.Query;
+import javax.management.QueryExp;
+
+import org.apache.helix.HelixManager;
+import org.apache.helix.HelixManagerFactory;
+import org.apache.helix.InstanceType;
+import org.apache.helix.TestHelper;
+import org.apache.helix.common.ZkTestBase;
+import org.apache.helix.integration.manager.ClusterControllerManager;
+import org.apache.helix.integration.manager.MockParticipantManager;
+import org.apache.helix.model.InstanceConfig;
+import org.apache.helix.tools.ClusterSetup;
+import org.apache.helix.tools.ClusterStateVerifier;
+import org.apache.helix.tools.ClusterVerifiers.BestPossibleExternalViewVerifier;
+import org.testng.Assert;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.Test;
+
+/**
+ * This test specifically tests MBean metrics instrumented in ClusterStatusMonitor that aggregate
+ * individual
+ * resource-level metrics into cluster-level figures.
+ * Sets up 3 Participants and 5 partitions with 3 replicas each, the test monitors the change in the
+ * numbers
+ * when a Participant is disabled.
+ */
+public class TestClusterAggregateMetrics extends ZkTestBase {
+
+  // Configurable values for test setup
+  private static final int NUM_PARTICIPANTS = 3;
+  private static final int NUM_PARTITIONS = 5;
+  private static final int NUM_REPLICAS = 3;
+
+  private static final String PARTITION_COUNT = "TotalPartitionGauge";
+  private static final String ERROR_PARTITION_COUNT = "ErrorPartitionGauge";
+  private static final String WITHOUT_TOPSTATE_COUNT = "MissingTopStatePartitionGauge";
+  private static final String IS_EV_MISMATCH_COUNT = "DifferenceWithIdealStateGauge";
+
+  private static final int START_PORT = 12918;
+  private static final String STATE_MODEL = "MasterSlave";
+  private static final String TEST_DB = "TestDB";
+  private static final MBeanServerConnection _server = ManagementFactory.getPlatformMBeanServer();
+  private final String CLASS_NAME = getShortClassName();
+  private final String CLUSTER_NAME = CLUSTER_PREFIX + "_" + CLASS_NAME;
+  private ClusterSetup _setupTool;
+  private HelixManager _manager;
+  private MockParticipantManager[] _participants = new MockParticipantManager[NUM_PARTICIPANTS];
+  private ClusterControllerManager _controller;
+  private Map<String, Object> _beanValueMap = new HashMap<>();
+
+  @BeforeClass
+  public void beforeClass() throws Exception {
+    System.out.println("START " + CLASS_NAME + " at " + new Date(System.currentTimeMillis()));
+
+    _setupTool = new ClusterSetup(ZK_ADDR);
+    // setup storage cluster
+    _setupTool.addCluster(CLUSTER_NAME, true);
+    _setupTool.addResourceToCluster(CLUSTER_NAME, TEST_DB, NUM_PARTITIONS, STATE_MODEL);
+
+    for (int i = 0; i < NUM_PARTICIPANTS; i++) {
+      String storageNodeName = PARTICIPANT_PREFIX + "_" + (START_PORT + i);
+      _setupTool.addInstanceToCluster(CLUSTER_NAME, storageNodeName);
+    }
+    _setupTool.rebalanceStorageCluster(CLUSTER_NAME, TEST_DB, NUM_REPLICAS);
+
+    // start dummy participants
+    for (int i = 0; i < NUM_PARTICIPANTS; i++) {
+      String instanceName = PARTICIPANT_PREFIX + "_" + (START_PORT + i);
+      _participants[i] = new MockParticipantManager(ZK_ADDR, CLUSTER_NAME, instanceName);
+      _participants[i].syncStart();
+    }
+
+    // start controller
+    String controllerName = CONTROLLER_PREFIX + "_0";
+    _controller = new ClusterControllerManager(ZK_ADDR, CLUSTER_NAME, controllerName);
+    _controller.syncStart();
+
+    boolean result = ClusterStateVerifier.verifyByPolling(
+        new ClusterStateVerifier.MasterNbInExtViewVerifier(ZK_ADDR, CLUSTER_NAME), 10000, 100);
+    Assert.assertTrue(result);
+
+    result = ClusterStateVerifier.verifyByPolling(
+        new ClusterStateVerifier.BestPossAndExtViewZkVerifier(ZK_ADDR, CLUSTER_NAME), 10000, 100);
+    Assert.assertTrue(result);
+
+    // create cluster manager
+    _manager = HelixManagerFactory.getZKHelixManager(CLUSTER_NAME, "Admin",
+        InstanceType.ADMINISTRATOR, ZK_ADDR);
+    _manager.connect();
+  }
+
+  /**
+   * Shutdown order: 1) disconnect the controller 2) disconnect participants.
+   */
+  @AfterClass
+  public void afterClass() {
+    if (_controller != null && _controller.isConnected()) {
+      _controller.syncStop();
+    }
+    for (int i = 0; i < NUM_PARTICIPANTS; i++) {
+      if (_participants[i] != null && _participants[i].isConnected()) {
+        _participants[i].syncStop();
+      }
+    }
+    if (_manager != null && _manager.isConnected()) {
+      _manager.disconnect();
+    }
+    deleteCluster(CLUSTER_NAME);
+    System.out.println("END " + CLASS_NAME + " at " + new Date(System.currentTimeMillis()));
+  }
+
+  @Test
+  public void testAggregateMetrics() throws Exception {
+    BestPossibleExternalViewVerifier verifier =
+        new BestPossibleExternalViewVerifier.Builder(CLUSTER_NAME)
+            .setZkClient(_gZkClient)
+            .setWaitTillVerify(TestHelper.DEFAULT_REBALANCE_PROCESSING_WAIT_TIME)
+            .build();
+
+    // Everything should be up and running initially with 5 total partitions
+    Map<String, Long> expectedMetricValues = new HashMap<>();
+    expectedMetricValues.put(PARTITION_COUNT, 5L);
+    expectedMetricValues.put(ERROR_PARTITION_COUNT, 0L);
+    expectedMetricValues.put(WITHOUT_TOPSTATE_COUNT, 0L);
+    expectedMetricValues.put(IS_EV_MISMATCH_COUNT, 0L);
+    Assert.assertTrue(verifyMetrics(expectedMetricValues));
+
+    // Disable all Participants (instances)
+    _setupTool.getClusterManagementTool()
+        .manuallyEnableMaintenanceMode(CLUSTER_NAME, true, "Test", null);
+    for (int i = 0; i < NUM_PARTICIPANTS; i++) {
+      String instanceName = PARTICIPANT_PREFIX + "_" + (START_PORT + i);
+      _setupTool.getClusterManagementTool().enableInstance(CLUSTER_NAME, instanceName, false);
+    }
+    _setupTool.getClusterManagementTool()
+        .manuallyEnableMaintenanceMode(CLUSTER_NAME, false, "Test", null);
+    // Confirm that the Participants have been disabled
+    boolean result = TestHelper.verify(() -> {
+      for (int i = 0; i < NUM_PARTICIPANTS; i++) {
+        String instanceName = PARTICIPANT_PREFIX + "_" + (START_PORT + i);
+        InstanceConfig instanceConfig =
+            _manager.getConfigAccessor().getInstanceConfig(CLUSTER_NAME, instanceName);
+        if (instanceConfig.getInstanceEnabled()) {
+          return false;
+        }
+      }
+      return true;
+    }, TestHelper.WAIT_DURATION);
+    Assert.assertTrue(result);
+    Assert.assertTrue(verifier.verifyByPolling());
+
+    expectedMetricValues.put(WITHOUT_TOPSTATE_COUNT, 5L);
+    Assert.assertTrue(verifyMetrics(expectedMetricValues));
+
+    // Re-enable all Participants (instances)
+    for (int i = 0; i < NUM_PARTICIPANTS; i++) {
+      String instanceName = PARTICIPANT_PREFIX + "_" + (START_PORT + i);
+      _setupTool.getClusterManagementTool().enableInstance(CLUSTER_NAME, instanceName, true);
+    }
+    // Confirm that the Participants have been enabled
+    result = TestHelper.verify(() -> {
+      for (int i = 0; i < NUM_PARTICIPANTS; i++) {
+        String instanceName = PARTICIPANT_PREFIX + "_" + (START_PORT + i);
+        InstanceConfig instanceConfig =
+            _manager.getConfigAccessor().getInstanceConfig(CLUSTER_NAME, instanceName);
+        if (!instanceConfig.getInstanceEnabled()) {
+          return false;
+        }
+      }
+      return true;
+    }, TestHelper.WAIT_DURATION);
+    Assert.assertTrue(result);
+    Assert.assertTrue(verifier.verifyByPolling());
+
+    expectedMetricValues.put(WITHOUT_TOPSTATE_COUNT, 0L);
+    Assert.assertTrue(verifyMetrics(expectedMetricValues));
+
+    // Drop the resource and check that all metrics are zero.
+    _setupTool.dropResourceFromCluster(CLUSTER_NAME, TEST_DB);
+    // Check that the resource has been removed
+    result = TestHelper.verify(
+        () -> _manager.getHelixDataAccessor().getPropertyStat(
+            _manager.getHelixDataAccessor().keyBuilder().idealStates(TEST_DB)) == null,
+        TestHelper.WAIT_DURATION);
+    Assert.assertTrue(result);
+    Assert.assertTrue(verifier.verifyByPolling());
+
+    expectedMetricValues.put(PARTITION_COUNT, 0L);
+    Assert.assertTrue(verifyMetrics(expectedMetricValues));
+  }
+
+  /**
+   * Queries for all MBeans from the MBean Server and only looks at the relevant MBean and gets its
+   * metric numbers.
+   */
+  private void updateMetrics() {
+    try {
+      QueryExp exp = Query.match(Query.attr("SensorName"), Query.value("*" + CLUSTER_NAME + "*"));
+      Set<ObjectInstance> mbeans = new HashSet<>(ManagementFactory.getPlatformMBeanServer()
+          .queryMBeans(new ObjectName("ClusterStatus:*"), exp));
+      for (ObjectInstance instance : mbeans) {
+        ObjectName beanName = instance.getObjectName();
+        if (beanName.toString().equals("ClusterStatus:cluster=" + CLUSTER_NAME)) {
+          MBeanInfo info = _server.getMBeanInfo(beanName);
+          MBeanAttributeInfo[] infos = info.getAttributes();
+          for (MBeanAttributeInfo infoItem : infos) {
+            Object val = _server.getAttribute(beanName, infoItem.getName());
+            _beanValueMap.put(infoItem.getName(), val);
+          }
+        }
+      }
+    } catch (Exception e) {
+      // update failed
+    }
+  }
+
+  private boolean verifyMetrics(Map<String, Long> expectedValues) {
+    updateMetrics();
+    return expectedValues.entrySet().stream()
+        .allMatch(entry -> _beanValueMap.get(entry.getKey()).equals(entry.getValue()));
+  }
+}
